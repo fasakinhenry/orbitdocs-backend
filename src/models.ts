@@ -9,6 +9,10 @@ export const User = model('User', new Schema({
   username: { type: String, required: true, unique: true, lowercase: true, trim: true },
   suspended: { type: Boolean, default: false },
   emailVerified: { type: Boolean, default: false },
+  avatarKey: String,
+  bio: { type: String, default: '' },
+  socialLinks: { type: Map, of: String, default: {} },
+  profilePublic: { type: Boolean, default: true },
   passwordChangedAt: Date,
 }, { timestamps: true }))
 
@@ -20,6 +24,8 @@ export const Org = model('Org', new Schema({
   logoKey: String,
   suspended: { type: Boolean, default: false },
   quotaBytes: Number,
+  visibility: { type: String, enum: ['public', 'private'], default: 'public' },
+  personal: { type: Boolean, default: false },
 }, { timestamps: true }))
 
 export const ROLES = ['member', 'admin', 'owner'] as const
@@ -35,6 +41,13 @@ export const Membership = model('Membership', membership)
 export const Folder = model('Folder', new Schema({
   org: ref('Org'),
   name: { type: String, required: true, trim: true },
+  access: [{
+    user: { type: Schema.Types.ObjectId, ref: 'User' },
+    view: { type: Boolean, default: true },
+    upload: { type: Boolean, default: false },
+    edit: { type: Boolean, default: false },
+    delete: { type: Boolean, default: false },
+  }],
 }, { timestamps: true }))
 
 const doc = new Schema({
@@ -94,6 +107,11 @@ export const JoinLink = model('JoinLink', new Schema({
   maxUses: Number,
   uses: { type: Number, default: 0 },
   revoked: { type: Boolean, default: false },
+}, { timestamps: true }))
+
+export const JoinRequest = model('JoinRequest', new Schema({
+  org: ref('Org'), user: ref('User'),
+  status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
 }, { timestamps: true }))
 
 export const Settings = model('Settings', new Schema({

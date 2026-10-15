@@ -7,7 +7,7 @@ import { Types } from 'mongoose'
 import rateLimit from 'express-rate-limit'
 import { Resend } from 'resend'
 import { env } from './config'
-import { Audit, Doc, Folder, Invite, JoinLink, Membership, Note, Org, Token, User } from './models'
+import { Audit, Doc, Folder, Invite, JoinLink, JoinRequest, Membership, Note, Org, Token, User } from './models'
 import { MB, getSettings, orgQuota, usedBytes } from './platform'
 import { audit, auth, clearRefresh, del, h, HttpError, member, orgOf, put, setRefresh, signAccess, signedGet, verifyRefresh } from './lib'
 
@@ -20,6 +20,7 @@ const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&l
 const oid = z.string().regex(/^[a-f\d]{24}$/i)
 const USERNAME = /^[a-z0-9_]{3,20}$/
 const RESERVED = ['admin', 'administrator', 'support', 'orbitdocs', 'root', 'help', 'system', 'staff']
+const SEED_FOLDERS = ['Partnerships & Collaborations', 'Events', 'Design & Branding', 'Technical Documentation', 'Content & Social Media', 'Community Operations', 'Archive']
 const idList = z.object({ ids: z.array(oid).min(1).max(100) })
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * MB, files: 5 } })
 const authLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false, skip: () => env.NODE_ENV === 'test' })
@@ -36,9 +37,10 @@ const dto = (d: DocLean, uid: string) => ({
 const withOwner = (ids: Types.ObjectId[]) => Doc.find({ _id: { $in: ids } }).populate('owner', 'name').lean<DocLean[]>()
 
 // ---------- auth ----------
-const pub = (u: { _id: unknown; name: string; username: string; email: string; emailVerified?: boolean }) => ({
+const pub = (u: { _id: unknown; name: string; username: string; email: string; emailVerified?: boolean; avatarKey?: string; bio?: string; socialLinks?: Map<string, string> | Record<string, string>; profilePublic?: boolean }) => ({
   id: String(u._id), name: u.name, username: u.username, email: u.email, emailVerified: !!u.emailVerified,
   isAdmin: !!u.emailVerified && u.email === env.ADMIN_EMAIL.toLowerCase(),
+  avatarUrl: null as string | null, bio: u.bio ?? '', socialLinks: u.socialLinks ?? {}, profilePublic: u.profilePublic !== false,
 })
 
 async function mail(to: string, subject: string, heading: string, text: string, cta: string, link: string, note: string) {
@@ -73,6 +75,9 @@ r.post('/auth/register', authLimit, h(async (req, res) => {
   if (RESERVED.includes(b.username) || (await User.exists({ username: b.username }))) throw new HttpError(409, 'That username is taken.')
   if (await User.exists({ email: b.email })) throw new HttpError(409, 'An account with this email already exists.')
   const u = await User.create({ name: b.name, username: b.username, email: b.email, passwordHash: await bcrypt.hash(b.password, 12) })
+  const personal = await Org.create({ name: `${u.name}'s Personal Workspace`, slug: `${u.username}-${randomBytes(4).toString('hex')}`, type: 'Personal', description: 'Your private workspace.', visibility: 'private', personal: true })
+  await Membership.create({ user: u._id, org: personal._id, role: 'owner' })
+  await Folder.insertMany(SEED_FOLDERS.map((name) => ({ org: personal._id, name })))
   await sendVerify(u).catch(() => undefined)
   setRefresh(res, u.id)
   res.status(201).json({ user: pub(u), accessToken: signAccess(u.id) })
@@ -145,23 +150,25 @@ r.post('/auth/logout', (_req, res) => { clearRefresh(res); res.status(204).end()
 r.get('/auth/me', auth, h(async (req, res) => {
   const u = await User.findById(req.uid)
   if (!u) throw new HttpError(401, 'Your session has expired. Sign in again.')
-  const ms = await Membership.find({ user: u.id }).populate<{ org: { _id: Types.ObjectId; name: string; slug: string; type: string; description?: string; logoKey?: string } }>('org').lean()
+  const ms = await Membership.find({ user: u.id }).populate<{ org: { _id: Types.ObjectId; name: string; slug: string; type: string; description?: string; logoKey?: string; visibility?: 'public' | 'private'; personal?: boolean } }>('org').lean()
   const orgs = await Promise.all(ms.map(async (m) => ({
     id: String(m.org._id), name: m.org.name, slug: m.org.slug, type: m.org.type, description: m.org.description ?? '', role: m.role,
+    visibility: m.org.visibility ?? 'public', personal: !!m.org.personal,
     logoUrl: m.org.logoKey ? await signedGet(m.org.logoKey) : null,
   })))
-  res.json({ user: pub(u), organizations: orgs })
+  const user = pub(u)
+  user.avatarUrl = u.avatarKey ? await signedGet(u.avatarKey) : null
+  res.json({ user, organizations: orgs })
 }))
 
 // ---------- organizations ----------
-const SEED_FOLDERS = ['Partnerships & Collaborations', 'Events', 'Design & Branding', 'Technical Documentation', 'Content & Social Media', 'Community Operations', 'Archive']
-
 r.post('/orgs', auth, h(async (req, res) => {
   const b = z.object({
     name: z.string().trim().min(2).max(80),
     slug: z.string().regex(/^[a-z0-9-]{3,30}$/, 'Use 3 to 30 lowercase letters, numbers, or hyphens.'),
     type: z.enum(['Student community', 'Nonprofit', 'Startup', 'Company', 'Educational institution', 'Professional community', 'Other']),
     description: z.string().trim().max(300).default(''),
+    visibility: z.enum(['public', 'private']).default('public'),
   }).parse(req.body)
   if (await Org.exists({ slug: b.slug })) throw new HttpError(409, 'That URL name is taken.')
   const org = await Org.create(b)
@@ -171,14 +178,60 @@ r.post('/orgs', auth, h(async (req, res) => {
   res.status(201).json({ id: org.id, name: org.name, slug: org.slug, type: org.type, role: 'owner', logoUrl: null })
 }))
 
+r.get('/profile/:username', authLimit, h(async (req, res) => {
+  const u = await User.findOne({ username: req.params.username.toLowerCase() }).select('name username avatarKey bio socialLinks profilePublic')
+  if (!u || !u.profilePublic) throw new HttpError(404, 'Profile not found.')
+  res.json({ id: String(u._id), name: u.name, username: u.username, avatarUrl: u.avatarKey ? await signedGet(u.avatarKey) : null, bio: u.bio ?? '', socialLinks: u.socialLinks ?? {} })
+}))
+
+r.patch('/profile', auth, h(async (req, res) => {
+  const b = z.object({
+    name: z.string().trim().min(2).max(80),
+    bio: z.string().trim().max(500).default(''),
+    socialLinks: z.record(z.string().trim().max(200)).default({}),
+    profilePublic: z.boolean().default(true),
+  }).parse(req.body)
+  const u = await User.findByIdAndUpdate(req.uid, b, { new: true })
+  if (!u) throw new HttpError(401, 'Your session has expired. Sign in again.')
+  const user = pub(u)
+  user.avatarUrl = u.avatarKey ? await signedGet(u.avatarKey) : null
+  res.json({ user })
+}))
+
+r.post('/profile/avatar', auth, upload.single('avatar'), h(async (req, res) => {
+  const f = req.file
+  if (!f || !f.mimetype.startsWith('image/') || f.size > 2_000_000) throw new HttpError(400, 'Choose an image under 2 MB.')
+  const key = `profiles/${req.uid}/${randomUUID()}`
+  await put(key, f.buffer, f.mimetype)
+  const u = await User.findByIdAndUpdate(req.uid, { avatarKey: key }, { new: true })
+  if (!u) throw new HttpError(401, 'Your session has expired. Sign in again.')
+  res.json({ user: { ...pub(u), avatarUrl: await signedGet(key) } })
+}))
+
 const o = Router({ mergeParams: true })
 r.use('/orgs/:orgId', auth, o)
 
 o.patch('/', member('admin'), h(async (req, res) => {
-  const b = z.object({ name: z.string().trim().min(2).max(80), description: z.string().trim().max(300) }).parse(req.body)
+  const b = z.object({ name: z.string().trim().min(2).max(80), description: z.string().trim().max(300), visibility: z.enum(['public', 'private']).default('public') }).parse(req.body)
   await Org.updateOne({ _id: orgOf(req) }, b)
   await audit(orgOf(req), req.uid!, 'org.update', b.name)
   res.status(204).end()
+}))
+
+r.get('/organizations/public', authLimit, h(async (_req, res) => {
+  const items = await Org.find({ visibility: 'public', personal: false, suspended: false }).sort({ name: 1 }).limit(100).select('name slug type description logoKey').lean()
+  res.json({ items: items.map((o) => ({ id: String(o._id), name: o.name, slug: o.slug, type: o.type, description: o.description ?? '', logoUrl: null })) })
+}))
+
+r.post('/organizations/:orgId/request', auth, h(async (req, res) => {
+  const org = await Org.findOne({ _id: oid.parse(req.params.orgId), visibility: 'public', personal: false, suspended: false })
+  if (!org) throw new HttpError(404, 'Organization not found.')
+  if (await Membership.exists({ org: org._id, user: req.uid })) throw new HttpError(409, 'You are already a member.')
+  const request = await JoinRequest.findOneAndUpdate({ org: org._id, user: req.uid }, { status: 'pending' }, { upsert: true, new: true })
+  const admins = await Membership.find({ org: org._id, role: { $in: ['owner', 'admin'] } }).select('user').lean()
+  const requester = await User.findById(req.uid).select('name')
+  await notify(admins.map((m) => m.user), org._id, `${requester?.name ?? 'Someone'} requested to join ${org.name}`)
+  res.status(201).json({ id: String(request._id) })
 }))
 
 o.get('/notifications', member('member'), h(async (req, res) => {
@@ -210,7 +263,8 @@ o.get('/folders', member('member'), h(async (req, res) => {
     Doc.aggregate<{ _id: Types.ObjectId; count: number }>([{ $match: { org, trashed: false } }, { $group: { _id: '$folder', count: { $sum: 1 } } }]),
   ])
   const n = new Map(counts.map((c) => [String(c._id), c.count]))
-  res.json({ items: folders.map((f) => ({ id: String(f._id), name: f.name, count: n.get(String(f._id)) ?? 0, updated: f.updatedAt })) })
+  const visible = req.role === 'member' ? folders.filter((f) => !f.access?.length || f.access.some((a) => String(a.user) === req.uid && a.view)) : folders
+  res.json({ items: visible.map((f) => ({ id: String(f._id), name: f.name, count: n.get(String(f._id)) ?? 0, updated: f.updatedAt })) })
 }))
 
 o.post('/folders', member('admin'), h(async (req, res) => {
@@ -220,6 +274,23 @@ o.post('/folders', member('admin'), h(async (req, res) => {
   const f = await Folder.create({ org, name })
   await audit(org, req.uid!, 'folder.create', name)
   res.status(201).json({ id: f.id, name: f.name, count: 0, updated: f.updatedAt })
+}))
+
+o.patch('/folders/:folderId/access', member('admin'), h(async (req, res) => {
+  const b = z.object({
+    userId: oid,
+    view: z.boolean(),
+    upload: z.boolean(),
+    edit: z.boolean(),
+    delete: z.boolean(),
+  }).parse(req.body)
+  const folder = await Folder.findOne({ _id: oid.parse(req.params.folderId), org: orgOf(req) })
+  if (!folder || !(await Membership.exists({ org: orgOf(req), user: b.userId }))) throw new HttpError(404, 'Folder or member not found.')
+  const access = folder.access as Array<{ user: Types.ObjectId }>
+  folder.access = access.filter((a) => String(a.user) !== b.userId)
+  if (b.view || b.upload || b.edit || b.delete) folder.access.push({ user: b.userId, view: b.view, upload: b.upload, edit: b.edit, delete: b.delete } as never)
+  await folder.save()
+  res.status(204).end()
 }))
 
 // ---------- documents ----------
@@ -246,6 +317,11 @@ o.post('/documents', member('member'), upload.array('files', 10), h(async (req: 
   const { folderId } = z.object({ folderId: oid }).parse(req.body)
   const org = orgOf(req)
   if (!(await Folder.exists({ _id: folderId, org }))) throw new HttpError(404, 'Folder not found.')
+  if (req.role === 'member') {
+    const folder = await Folder.findById(folderId).select('access')
+    const access = folder?.access?.find((a) => String(a.user) === req.uid)
+    if (folder?.access?.length && !access?.upload) throw new HttpError(403, 'You do not have upload access to this folder.')
+  }
   const files = (req.files as Express.Multer.File[] | undefined) ?? []
   if (!files.length) throw new HttpError(400, 'Choose at least one file.')
   const [cfg, used, quota] = await Promise.all([getSettings(), usedBytes(org), orgQuota(org)])
@@ -343,6 +419,29 @@ o.get('/members', member('member'), h(async (req, res) => {
   })
 }))
 
+o.get('/member-search', member('admin'), h(async (req, res) => {
+  const q = z.string().trim().toLowerCase().min(2).max(80).parse(req.query.q)
+  const users = await User.find({ $or: [{ email: { $regex: q, $options: 'i' } }, { username: { $regex: q, $options: 'i' } }], _id: { $nin: await Membership.find({ org: orgOf(req) }).distinct('user') } })
+    .select('name username email').limit(8).lean()
+  res.json({ items: users.map((u) => ({ name: u.name, username: u.username, email: u.email })) })
+}))
+
+o.get('/requests', member('admin'), h(async (req, res) => {
+  const items = await JoinRequest.find({ org: orgOf(req), status: 'pending' }).populate<{ user: { name: string; username: string } }>('user', 'name username').lean()
+  res.json({ items: items.map((i) => ({ id: String(i._id), userId: String(i.user._id), name: i.user.name, username: i.user.username, createdAt: i.createdAt })) })
+}))
+
+o.patch('/requests/:id', member('admin'), h(async (req, res) => {
+  const { status } = z.object({ status: z.enum(['approved', 'rejected']) }).parse(req.body)
+  const request = await JoinRequest.findOne({ _id: oid.parse(req.params.id), org: orgOf(req), status: 'pending' })
+  if (!request) throw new HttpError(404, 'Join request not found.')
+  if (status === 'approved') await Membership.updateOne({ org: request.org, user: request.user }, { $setOnInsert: { role: 'member' } }, { upsert: true })
+  request.status = status
+  await request.save()
+  await notify([request.user], orgOf(req), status === 'approved' ? 'Your request to join the workspace was approved.' : 'Your request to join the workspace was declined.')
+  res.status(204).end()
+}))
+
 o.post('/invites', member('admin'), h(async (req, res) => {
   const b = z.object({
     email: z.string().trim().toLowerCase().email().optional(),
@@ -354,7 +453,7 @@ o.post('/invites', member('admin'), h(async (req, res) => {
   if (b.username && !target) throw new HttpError(404, 'No one has that username.')
   const email = target ? target.email : b.email!
   const label = target ? `@${target.username}` : email
-  if (b.role === 'admin' && req.role !== 'owner') throw new HttpError(403, 'Only the owner can invite admins.')
+  if (b.role === 'admin' && !['owner', 'admin'].includes(req.role!)) throw new HttpError(403, 'Only an admin can invite admins.')
   const org = orgOf(req)
   const existing = target ?? (await User.findOne({ email }))
   if (existing && (await Membership.exists({ org, user: existing._id }))) throw new HttpError(409, 'This person is already a member.')
@@ -384,12 +483,12 @@ o.delete('/invites/:id', member('admin'), h(async (req, res) => {
   res.status(204).end()
 }))
 
-o.patch('/members/:userId', member('owner'), h(async (req, res) => {
+o.patch('/members/:userId', member('admin'), h(async (req, res) => {
   const userId = oid.parse(req.params.userId)
   const { role } = z.object({ role: z.enum(['admin', 'member']) }).parse(req.body)
   const m = await Membership.findOne({ org: orgOf(req), user: userId })
   if (!m) throw new HttpError(404, 'Member not found.')
-  if (m.role === 'owner') throw new HttpError(400, 'The owner role cannot be changed.')
+  if (m.role === 'owner' || (m.role === 'admin' && req.role !== 'owner' && role !== 'admin')) throw new HttpError(403, 'Only the owner can change an admin role.')
   m.role = role
   await m.save()
   const target = await User.findById(userId).select('name')
@@ -455,6 +554,9 @@ r.post('/join/:token', authLimit, auth, h(async (req, res) => {
   }
   const u = await User.findById(req.uid)
   await Membership.create({ user: req.uid, org: l.org, role: 'member' })
+  const admins = await Membership.find({ org: l.org, role: { $in: ['owner', 'admin'] }, user: { $ne: new Types.ObjectId(req.uid!) } }).select('user').lean()
+  const joined = await User.findById(req.uid).select('name username')
+  await notify(admins.map((m) => m.user), l.org, `${joined?.name ?? 'A member'} joined the workspace`)
   await audit(l.org, req.uid!, 'link.join', u ? `@${u.username}` : '')
   res.json({ orgId: String(l.org) })
 }))
