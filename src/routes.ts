@@ -163,7 +163,6 @@ r.post('/orgs', auth, h(async (req, res) => {
     type: z.enum(['Student community', 'Nonprofit', 'Startup', 'Company', 'Educational institution', 'Professional community', 'Other']),
     description: z.string().trim().max(300).default(''),
   }).parse(req.body)
-  if (!(await User.exists({ _id: req.uid, emailVerified: true }))) throw new HttpError(403, 'Verify your email before creating a workspace.')
   if (await Org.exists({ slug: b.slug })) throw new HttpError(409, 'That URL name is taken.')
   const org = await Org.create(b)
   await Membership.create({ user: req.uid, org: org._id, role: 'owner' })
