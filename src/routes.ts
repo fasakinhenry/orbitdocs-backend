@@ -64,6 +64,20 @@ const sendVerify = async (u: { _id: Types.ObjectId; email: string }) =>
   mail(u.email, 'Verify your email for OrbitDocs', 'Confirm your email', 'Use the button below to finish setting up your OrbitDocs account.', 'Verify email',
     `${env.CLIENT_URL}/verify/${await issue(u._id, 'verify', 24)}`, 'This link expires in 24 hours.')
 
+async function deleteOrganization(id: Types.ObjectId) {
+  const org = await Org.findById(id)
+  if (!org) throw new HttpError(404, 'Workspace not found.')
+  const docs = await Doc.find({ org: id }).select('key').lean()
+  await Promise.all(docs.map((d) => del(d.key)))
+  await Promise.all([
+    Doc.deleteMany({ org: id }), Folder.deleteMany({ org: id }), Membership.deleteMany({ org: id }),
+    Invite.deleteMany({ org: id }), JoinLink.deleteMany({ org: id }), JoinRequest.deleteMany({ org: id }),
+    Note.deleteMany({ org: id }), Audit.deleteMany({ org: id }),
+  ])
+  if (org.logoKey) await del(org.logoKey)
+  await org.deleteOne()
+}
+
 r.post('/auth/register', authLimit, h(async (req, res) => {
   const b = z.object({
     name: z.string().trim().min(2).max(80),
@@ -198,6 +212,24 @@ r.patch('/profile', auth, h(async (req, res) => {
   res.json({ user })
 }))
 
+r.delete('/profile', auth, h(async (req, res) => {
+  const id = new Types.ObjectId(req.uid!)
+  const ownedOrgs = await Membership.find({ user: id, role: 'owner' }).populate<{ org: { _id: Types.ObjectId; personal?: boolean } }>('org', '_id personal').lean()
+  if (ownedOrgs.some((m) => !m.org.personal)) throw new HttpError(409, 'Delete organizations you own before deleting your profile.')
+  const u = await User.findById(id)
+  if (!u) throw new HttpError(401, 'Your session has expired. Sign in again.')
+  await Promise.all(ownedOrgs.map((m) => deleteOrganization(m.org._id)))
+  const docs = await Doc.find({ owner: id }).select('key').lean()
+  await Promise.all(docs.map((d) => del(d.key)))
+  if (u.avatarKey) await del(u.avatarKey)
+  await Promise.all([
+    Doc.deleteMany({ owner: id }), Membership.deleteMany({ user: id }), Token.deleteMany({ user: id }),
+    Note.deleteMany({ user: id }), Invite.deleteMany({ email: u.email }), JoinRequest.deleteMany({ user: id }),
+  ])
+  await u.deleteOne()
+  res.status(204).end()
+}))
+
 r.post('/profile/avatar', auth, upload.single('avatar'), h(async (req, res) => {
   const f = req.file
   if (!f || !f.mimetype.startsWith('image/') || f.size > 2_000_000) throw new HttpError(400, 'Choose an image under 2 MB.')
@@ -210,6 +242,16 @@ r.post('/profile/avatar', auth, upload.single('avatar'), h(async (req, res) => {
 
 const o = Router({ mergeParams: true })
 r.use('/orgs/:orgId', auth, o)
+
+r.delete('/orgs/:orgId', auth, h(async (req, res) => {
+  const id = oid.parse(req.params.orgId)
+  const u = await User.findById(req.uid).select('email emailVerified')
+  const membership = await Membership.findOne({ org: id, user: req.uid }).select('role')
+  const superadmin = !!u?.emailVerified && u.email === env.ADMIN_EMAIL.toLowerCase()
+  if (!superadmin && membership?.role !== 'owner') throw new HttpError(403, 'Only the organization creator or platform administrator can delete this workspace.')
+  await deleteOrganization(new Types.ObjectId(id))
+  res.status(204).end()
+}))
 
 o.patch('/', member('admin'), h(async (req, res) => {
   const b = z.object({ name: z.string().trim().min(2).max(80), description: z.string().trim().max(300), visibility: z.enum(['public', 'private']).default('public') }).parse(req.body)
