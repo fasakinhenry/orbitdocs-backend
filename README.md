@@ -1,6 +1,37 @@
 # OrbitDocs backend
 
-Node, Express, TypeScript, MongoDB (Mongoose), any S3 compatible storage (Backblaze B2, AWS S3, Cloudflare R2, Wasabi, MinIO).
+The OrbitDocs API powers a collaborative document platform for personal
+workspaces and organizations. It provides authentication, organization
+membership, file storage, folder permissions, approvals, notifications, and
+administration for the OrbitDocs frontend.
+
+> Check it out here: https://orbitdoc.vercel.app
+
+## Product capabilities
+
+The backend supports:
+
+- Personal workspaces created automatically for every account.
+- Organization creation with public or private visibility.
+- Public organization discovery and membership requests.
+- Email, username, invitation-token, and shareable-link onboarding.
+- In-app invitations and notifications when email delivery is unavailable.
+- Owner, administrator, and member roles.
+- Public and private folders with per-member permissions.
+- Folder-level view, upload, edit, delete, and manager access.
+- File upload, download, preview URLs, starring, search, sorting, pagination,
+  copy, and move operations.
+- File approval workflows, including submit, approve, return to draft, and
+  withdraw submission.
+- Deletion requests that require approval from authorized folder managers.
+- Profile management, avatars, social links, profile visibility, and default
+  file-view preferences.
+- Storage quotas, per-file limits, organization suspension, and platform
+  administration.
+
+Folder visibility is enforced server-side. A member who does not have view
+access cannot see the folder or the files inside it, even if they know the
+folder or document identifier.
 
 ## Storage
 
@@ -53,7 +84,20 @@ Build command: `npm install && npm run build`. Start command: `npm start`. Creat
 
 ## Roles
 
-`owner` > `admin` > `member`. Members can view, search, upload, star, and download. Admins can also create folders, trash, restore, delete forever, approve, set the logo, and read activity. Non-members get a 404 for any organization route.
+`owner` > `admin` > `member`.
+
+- **Owner**: full organization access, member and administrator management,
+  organization deletion, folder management, approvals, and storage controls.
+- **Admin**: organization administration, invitations, member requests,
+  folder administration, approvals, and activity access where permitted.
+- **Member**: access to the folders and files explicitly available to them,
+  including upload, search, download, and file workflows allowed by folder
+  permissions.
+
+Folder manager access is separate from the organization role hierarchy. An
+administrator or selected member can manage one folder without automatically
+seeing other private folders. Non-members receive a 404 for organization
+routes.
 
 ## Endpoints (all under /api)
 
@@ -69,11 +113,16 @@ Build command: `npm install && npm run build`. Start command: `npm start`. Creat
 | GET | /orgs/:orgId/notifications | member |
 | POST | /orgs/:orgId/notifications/read | member |
 | GET, POST | /orgs/:orgId/folders | member, admin |
+| PATCH, DELETE | /orgs/:orgId/folders/:folderId | folder manager or owner |
+| GET, PATCH | /orgs/:orgId/folders/:folderId/access | folder manager or owner |
 | GET | /orgs/:orgId/documents?view&folder&q&sort&dir&page&limit | member |
 | POST | /orgs/:orgId/documents (multipart: files, folderId) | member |
+| GET | /orgs/:orgId/documents/:id | member with folder access |
+| POST | /orgs/:orgId/documents/copy, /move | member with source and destination access |
 | POST | /orgs/:orgId/documents/star | member |
 | POST | /orgs/:orgId/documents/submit | member (own drafts only) |
 | POST | /orgs/:orgId/documents/trash, /restore, /status | admin |
+| POST | /orgs/:orgId/documents/delete-request, /delete-decision | member, folder manager |
 | DELETE | /orgs/:orgId/documents | admin |
 | GET | /orgs/:orgId/documents/:id/download (add ?inline=1 for preview) | member |
 | GET | /orgs/:orgId/activity | admin |
@@ -92,9 +141,16 @@ Build command: `npm install && npm run build`. Start command: `npm start`. Creat
 
 Errors always look like `{ "error": { "message": "...", "fields"?: {...} } }`.
 
-## Not built yet
+## Storage and security model
 
-Nothing major. See below for tests.
+The API uses signed URLs for file access and stores file contents in an
+S3-compatible provider. File metadata and permissions are stored in MongoDB.
+Access tokens are short-lived, refresh tokens use an httpOnly cookie, and
+organization boundaries are checked on every protected route.
+
+Delete requests are recorded separately from immediate file deletion. This
+allows folder managers and organization owners to review destructive actions
+before files enter the trash.
 
 ## Tests
 
@@ -104,3 +160,5 @@ RUN_DB_TESTS=1 bun run test  # full workflow against an in-memory MongoDB (downl
 ```
 
 The full workflow test mocks Resend and file storage, and covers verification, roles, invitations, uploads, approvals, notifications, organization isolation, expired invites and password reset.
+
+> Built with 💖 by [Fasakin Henry](https://github.com/fasakinhenry)
