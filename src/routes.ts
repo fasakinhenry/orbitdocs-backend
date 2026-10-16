@@ -317,6 +317,30 @@ o.post('/folders', member('admin'), h(async (req, res) => {
   res.status(201).json({ id: f.id, name: f.name, count: 0, updated: f.updatedAt })
 }))
 
+o.patch('/folders/:folderId', member('admin'), h(async (req, res) => {
+  const { name } = z.object({ name: z.string().trim().min(1).max(80) }).parse(req.body)
+  const folderId = oid.parse(req.params.folderId)
+  const org = orgOf(req)
+  if (await Folder.exists({ org, name, _id: { $ne: folderId } }).collation({ locale: 'en', strength: 2 })) throw new HttpError(409, 'A folder with this name already exists.')
+  const folder = await Folder.findOneAndUpdate({ _id: folderId, org }, { name }, { new: true })
+  if (!folder) throw new HttpError(404, 'Folder not found.')
+  await audit(org, req.uid!, 'folder.rename', `${folder.name}`)
+  res.status(204).end()
+}))
+
+o.post('/folders/:folderId/duplicate', member('admin'), h(async (req, res) => {
+  const folderId = oid.parse(req.params.folderId)
+  const org = orgOf(req)
+  const folder = await Folder.findOne({ _id: folderId, org })
+  if (!folder) throw new HttpError(404, 'Folder not found.')
+  const base = `Copy of ${folder.name}`
+  let name = base
+  for (let i = 2; await Folder.exists({ org, name }).collation({ locale: 'en', strength: 2 }); i++) name = `${base} ${i}`
+  const copy = await Folder.create({ org, name })
+  await audit(org, req.uid!, 'folder.duplicate', `${folder.name} -> ${copy.name}`)
+  res.status(201).json({ id: copy.id, name: copy.name, count: 0, updated: copy.updatedAt })
+}))
+
 o.delete('/folders/:folderId', member('admin'), h(async (req, res) => {
   const folderId = oid.parse(req.params.folderId)
   const folder = await Folder.findOne({ _id: folderId, org: orgOf(req) })
