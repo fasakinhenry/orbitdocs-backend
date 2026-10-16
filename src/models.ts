@@ -41,6 +41,7 @@ export const Membership = model('Membership', membership)
 export const Folder = model('Folder', new Schema({
   org: ref('Org'),
   name: { type: String, required: true, trim: true },
+  visibility: { type: String, enum: ['public', 'private'], default: 'public' },
   access: [{
     user: { type: Schema.Types.ObjectId, ref: 'User' },
     view: { type: Boolean, default: true },
