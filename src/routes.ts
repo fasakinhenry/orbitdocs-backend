@@ -91,7 +91,6 @@ r.post('/auth/register', authLimit, h(async (req, res) => {
   const u = await User.create({ name: b.name, username: b.username, email: b.email, passwordHash: await bcrypt.hash(b.password, 12) })
   const personal = await Org.create({ name: `${u.name}'s Personal Workspace`, slug: `${u.username}-${randomBytes(4).toString('hex')}`, type: 'Personal', description: 'Your private workspace.', visibility: 'private', personal: true })
   await Membership.create({ user: u._id, org: personal._id, role: 'owner' })
-  await Folder.insertMany(SEED_FOLDERS.map((name) => ({ org: personal._id, name })))
   await sendVerify(u).catch(() => undefined)
   setRefresh(res, u.id)
   res.status(201).json({ user: pub(u), accessToken: signAccess(u.id) })
@@ -316,6 +315,16 @@ o.post('/folders', member('admin'), h(async (req, res) => {
   const f = await Folder.create({ org, name })
   await audit(org, req.uid!, 'folder.create', name)
   res.status(201).json({ id: f.id, name: f.name, count: 0, updated: f.updatedAt })
+}))
+
+o.delete('/folders/:folderId', member('admin'), h(async (req, res) => {
+  const folderId = oid.parse(req.params.folderId)
+  const folder = await Folder.findOne({ _id: folderId, org: orgOf(req) })
+  if (!folder) throw new HttpError(404, 'Folder not found.')
+  if (await Doc.exists({ folder: folderId })) throw new HttpError(409, 'Move or delete the files in this folder before deleting it.')
+  await folder.deleteOne()
+  await audit(orgOf(req), req.uid!, 'folder.delete', folder.name)
+  res.status(204).end()
 }))
 
 o.patch('/folders/:folderId/access', member('admin'), h(async (req, res) => {
