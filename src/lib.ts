@@ -1,7 +1,7 @@
 import type { NextFunction, Request, RequestHandler, Response } from 'express'
 import jwt from 'jsonwebtoken'
 import { Types } from 'mongoose'
-export { del, put, signedGet } from './storage'
+export { copy, del, put, signedGet } from './storage'
 import { env } from './config'
 import { Audit, Membership, Org, ROLES, User, type Role } from './models'
 

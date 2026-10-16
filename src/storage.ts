@@ -1,4 +1,4 @@
-import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
+import { CopyObjectCommand, DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { env } from './config'
 
@@ -21,6 +21,8 @@ export const storageInfo = { provider: env.STORAGE_PROVIDER, bucket: env.STORAGE
 export const put = (Key: string, Body: Buffer, ContentType?: string) =>
   s3.send(new PutObjectCommand({ Bucket: env.STORAGE_BUCKET, Key, Body, ContentType }))
 export const del = (Key: string) => s3.send(new DeleteObjectCommand({ Bucket: env.STORAGE_BUCKET, Key }))
+export const copy = (Source: string, Key: string, ContentType?: string) =>
+  s3.send(new CopyObjectCommand({ Bucket: env.STORAGE_BUCKET, CopySource: `${env.STORAGE_BUCKET}/${Source}`, Key, ContentType, MetadataDirective: ContentType ? 'REPLACE' : 'COPY' }))
 export const signedGet = (Key: string, filename?: string, inline = false) =>
   getSignedUrl(s3, new GetObjectCommand({
     Bucket: env.STORAGE_BUCKET, Key,

@@ -47,6 +47,7 @@ export const Folder = model('Folder', new Schema({
     upload: { type: Boolean, default: false },
     edit: { type: Boolean, default: false },
     delete: { type: Boolean, default: false },
+    manage: { type: Boolean, default: false },
   }],
 }, { timestamps: true }))
 
@@ -59,6 +60,8 @@ const doc = new Schema({
   status: { type: String, enum: ['draft', 'pending', 'approved'], default: 'draft' },
   starredBy: [{ type: Schema.Types.ObjectId, ref: 'User' }],
   trashed: { type: Boolean, default: false },
+  deleteRequestedBy: { type: Schema.Types.ObjectId, ref: 'User' },
+  deleteRequestedAt: Date,
 }, { timestamps: true })
 doc.index({ org: 1, trashed: 1, updatedAt: -1 })
 export const Doc = model('Doc', doc)

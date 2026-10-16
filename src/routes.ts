@@ -9,7 +9,7 @@ import { Resend } from 'resend'
 import { env } from './config'
 import { Audit, Doc, Folder, Invite, JoinLink, JoinRequest, Membership, Note, Org, Token, User } from './models'
 import { MB, getSettings, orgQuota, usedBytes } from './platform'
-import { audit, auth, clearRefresh, del, h, HttpError, member, orgOf, put, setRefresh, signAccess, signedGet, verifyRefresh } from './lib'
+import { audit, auth, clearRefresh, copy, del, h, HttpError, member, orgOf, put, setRefresh, signAccess, signedGet, verifyRefresh } from './lib'
 
 const r = Router()
 const resend = new Resend(env.RESEND_API_KEY)
@@ -27,11 +27,13 @@ const authLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeade
 
 interface DocLean {
   _id: Types.ObjectId; name: string; folder: Types.ObjectId; owner?: { _id: Types.ObjectId; name: string }
-  size: number; status: string; starredBy: Types.ObjectId[]; trashed: boolean; updatedAt: Date
+  size: number; status: string; starredBy: Types.ObjectId[]; trashed: boolean; updatedAt: Date; createdAt: Date; mime?: string
+  deleteRequestedBy?: Types.ObjectId; deleteRequestedAt?: Date
 }
 const dto = (d: DocLean, uid: string) => ({
   id: String(d._id), name: d.name, folderId: String(d.folder), owner: d.owner?.name ?? 'Former member', ownerId: d.owner ? String(d.owner._id) : '',
-  size: d.size, modified: d.updatedAt, status: d.status, trashed: d.trashed,
+  size: d.size, modified: d.updatedAt, status: d.status, trashed: d.trashed, mime: d.mime,
+  deleteRequested: !!d.deleteRequestedAt,
   starred: d.starredBy.some((s) => String(s) === uid),
 })
 const withOwner = (ids: Types.ObjectId[]) => Doc.find({ _id: { $in: ids } }).populate('owner', 'name').lean<DocLean[]>()
@@ -297,6 +299,14 @@ o.post('/logo', member('admin'), upload.single('logo'), h(async (req, res) => {
 }))
 
 // ---------- folders ----------
+type FolderAccess = { user: Types.ObjectId; view?: boolean; upload?: boolean; edit?: boolean; delete?: boolean; manage?: boolean }
+const folderPermission = (folder: { access?: FolderAccess[] }, req: Request, permission: 'view' | 'upload' | 'edit' | 'delete' | 'manage') =>
+  req.role === 'owner' || !!folder.access?.find((a) => String(a.user) === req.uid && a[permission])
+const visibleFolderIds = async (req: Request) => {
+  const folders = await Folder.find({ org: orgOf(req) }).select('_id access').lean()
+  return folders.filter((f) => !f.access?.length || folderPermission(f, req, 'view')).map((f) => f._id)
+}
+
 o.get('/folders', member('member'), h(async (req, res) => {
   const org = orgOf(req)
   const [folders, counts] = await Promise.all([
@@ -304,7 +314,7 @@ o.get('/folders', member('member'), h(async (req, res) => {
     Doc.aggregate<{ _id: Types.ObjectId; count: number }>([{ $match: { org, trashed: false } }, { $group: { _id: '$folder', count: { $sum: 1 } } }]),
   ])
   const n = new Map(counts.map((c) => [String(c._id), c.count]))
-  const visible = req.role === 'member' ? folders.filter((f) => !f.access?.length || f.access.some((a) => String(a.user) === req.uid && a.view)) : folders
+  const visible = req.role === 'owner' ? folders : folders.filter((f) => !f.access?.length || f.access.some((a) => String(a.user) === req.uid && a.view))
   res.json({ items: visible.map((f) => ({ id: String(f._id), name: f.name, count: n.get(String(f._id)) ?? 0, updated: f.updatedAt })) })
 }))
 
@@ -324,6 +334,7 @@ o.patch('/folders/:folderId', member('admin'), h(async (req, res) => {
   if (await Folder.exists({ org, name, _id: { $ne: folderId } }).collation({ locale: 'en', strength: 2 })) throw new HttpError(409, 'A folder with this name already exists.')
   const folder = await Folder.findOneAndUpdate({ _id: folderId, org }, { name }, { new: true })
   if (!folder) throw new HttpError(404, 'Folder not found.')
+  if (req.role !== 'owner' && !folderPermission(folder, req, 'manage')) throw new HttpError(403, 'Only folder managers can rename this folder.')
   await audit(org, req.uid!, 'folder.rename', `${folder.name}`)
   res.status(204).end()
 }))
@@ -333,6 +344,7 @@ o.post('/folders/:folderId/duplicate', member('admin'), h(async (req, res) => {
   const org = orgOf(req)
   const folder = await Folder.findOne({ _id: folderId, org })
   if (!folder) throw new HttpError(404, 'Folder not found.')
+  if (req.role !== 'owner' && !folderPermission(folder, req, 'manage')) throw new HttpError(403, 'Only folder managers can duplicate this folder.')
   const base = `Copy of ${folder.name}`
   let name = base
   for (let i = 2; await Folder.exists({ org, name }).collation({ locale: 'en', strength: 2 }); i++) name = `${base} ${i}`
@@ -345,6 +357,7 @@ o.delete('/folders/:folderId', member('admin'), h(async (req, res) => {
   const folderId = oid.parse(req.params.folderId)
   const folder = await Folder.findOne({ _id: folderId, org: orgOf(req) })
   if (!folder) throw new HttpError(404, 'Folder not found.')
+  if (req.role !== 'owner' && !folderPermission(folder, req, 'manage')) throw new HttpError(403, 'Only folder managers can delete this folder.')
   if (await Doc.exists({ folder: folderId })) throw new HttpError(409, 'Move or delete the files in this folder before deleting it.')
   await folder.deleteOne()
   await audit(orgOf(req), req.uid!, 'folder.delete', folder.name)
@@ -358,14 +371,25 @@ o.patch('/folders/:folderId/access', member('admin'), h(async (req, res) => {
     upload: z.boolean(),
     edit: z.boolean(),
     delete: z.boolean(),
+    manage: z.boolean().default(false),
   }).parse(req.body)
   const folder = await Folder.findOne({ _id: oid.parse(req.params.folderId), org: orgOf(req) })
   if (!folder || !(await Membership.exists({ org: orgOf(req), user: b.userId }))) throw new HttpError(404, 'Folder or member not found.')
-  const access = folder.access as Array<{ user: Types.ObjectId }>
+  if (req.role !== 'owner' && !folderPermission(folder, req, 'manage')) throw new HttpError(403, 'Only folder managers can edit folder access.')
+  const access = folder.access as FolderAccess[]
   folder.access = access.filter((a) => String(a.user) !== b.userId)
-  if (b.view || b.upload || b.edit || b.delete) folder.access.push({ user: b.userId, view: b.view, upload: b.upload, edit: b.edit, delete: b.delete } as never)
+  if (b.view || b.upload || b.edit || b.delete || b.manage) folder.access.push({ user: b.userId, view: b.view, upload: b.upload, edit: b.edit, delete: b.delete, manage: b.manage } as never)
   await folder.save()
   res.status(204).end()
+}))
+
+o.get('/folders/:folderId/access', member('admin'), h(async (req, res) => {
+  const folder = await Folder.findOne({ _id: oid.parse(req.params.folderId), org: orgOf(req) }).lean()
+  if (!folder) throw new HttpError(404, 'Folder not found.')
+  if (req.role !== 'owner' && !folderPermission(folder, req, 'manage')) throw new HttpError(403, 'Only folder managers can view folder access.')
+  const members = await Membership.find({ org: orgOf(req) }).populate<{ user: { _id: Types.ObjectId; name: string; username: string } }>('user', 'name username').lean()
+  const access = new Map((folder.access ?? []).map((a) => [String(a.user), a]))
+  res.json({ items: members.map((m) => ({ id: String(m.user._id), name: m.user.name, username: m.user.username, view: m.role === 'owner' || !!access.get(String(m.user._id))?.view, upload: !!access.get(String(m.user._id))?.upload, edit: !!access.get(String(m.user._id))?.edit, delete: !!access.get(String(m.user._id))?.delete, manage: m.role === 'owner' || !!access.get(String(m.user._id))?.manage })) })
 }))
 
 // ---------- documents ----------
@@ -377,8 +401,13 @@ o.get('/documents', member('member'), h(async (req, res) => {
     page: z.coerce.number().int().min(1).default(1), limit: z.coerce.number().int().min(1).max(100).default(25),
   }).parse(req.query)
   const f: Record<string, unknown> = { org: orgOf(req), trashed: q.view === 'trash' }
+  if (req.role !== 'owner') f.folder = { $in: await visibleFolderIds(req) }
   if (q.view === 'starred') f.starredBy = new Types.ObjectId(req.uid!)
-  if (q.folder) f.folder = q.folder
+  if (q.folder) {
+    const allowed = q.folder === String((await visibleFolderIds(req)).find((id) => String(id) === q.folder))
+    if (!allowed) throw new HttpError(404, 'Folder not found.')
+    f.folder = q.folder
+  }
   if (q.q) f.name = { $regex: q.q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' }
   const field = { name: 'name', modified: 'updatedAt', size: 'size' }[q.sort]
   const [items, total] = await Promise.all([
@@ -392,10 +421,10 @@ o.post('/documents', member('member'), upload.array('files', 10), h(async (req: 
   const { folderId } = z.object({ folderId: oid }).parse(req.body)
   const org = orgOf(req)
   if (!(await Folder.exists({ _id: folderId, org }))) throw new HttpError(404, 'Folder not found.')
-  if (req.role === 'member') {
+  if (req.role !== 'owner') {
     const folder = await Folder.findById(folderId).select('access')
     const access = folder?.access?.find((a) => String(a.user) === req.uid)
-    if (folder?.access?.length && !access?.upload) throw new HttpError(403, 'You do not have upload access to this folder.')
+    if (!folder || (folder.access?.length && !access?.upload)) throw new HttpError(403, 'You do not have upload access to this folder.')
   }
   const files = (req.files as Express.Multer.File[] | undefined) ?? []
   if (!files.length) throw new HttpError(400, 'Choose at least one file.')
@@ -423,6 +452,11 @@ o.post('/documents/star', member('member'), h(async (req, res) => {
 
 o.post('/documents/trash', member('admin'), h(async (req, res) => {
   const { ids } = idList.parse(req.body)
+  const docs = await Doc.find({ org: orgOf(req), _id: { $in: ids } }).select('folder')
+  for (const d of docs) {
+    const folder = await Folder.findById(d.folder).select('access')
+    if (req.role !== 'owner' && !folderPermission(folder ?? {}, req, 'manage')) throw new HttpError(403, 'Only folder managers can delete files in this folder.')
+  }
   const x = await Doc.updateMany({ org: orgOf(req), _id: { $in: ids } }, { trashed: true })
   await audit(orgOf(req), req.uid!, 'document.trash', `${x.modifiedCount} file(s)`)
   res.status(204).end()
@@ -430,6 +464,11 @@ o.post('/documents/trash', member('admin'), h(async (req, res) => {
 
 o.post('/documents/restore', member('admin'), h(async (req, res) => {
   const { ids } = idList.parse(req.body)
+  const docs = await Doc.find({ org: orgOf(req), _id: { $in: ids } }).select('folder')
+  for (const d of docs) {
+    const folder = await Folder.findById(d.folder).select('access')
+    if (req.role !== 'owner' && !folderPermission(folder ?? {}, req, 'manage')) throw new HttpError(403, 'Only folder managers can restore files in this folder.')
+  }
   const x = await Doc.updateMany({ org: orgOf(req), _id: { $in: ids } }, { trashed: false })
   await audit(orgOf(req), req.uid!, 'document.restore', `${x.modifiedCount} file(s)`)
   res.status(204).end()
@@ -438,7 +477,11 @@ o.post('/documents/restore', member('admin'), h(async (req, res) => {
 // Members can send their own drafts for review. Only admins can approve or return documents.
 o.post('/documents/submit', member('member'), h(async (req, res) => {
   const { ids } = idList.parse(req.body)
-  const x = await Doc.updateMany({ org: orgOf(req), _id: { $in: ids }, owner: req.uid, status: 'draft', trashed: false }, { status: 'pending' })
+  const current = await Doc.find({ org: orgOf(req), _id: { $in: ids }, owner: req.uid, trashed: false }).select('status').lean()
+  const pending = current.filter((d) => d.status === 'pending').map((d) => d._id)
+  const draft = current.filter((d) => d.status === 'draft').map((d) => d._id)
+  if (pending.length) await Doc.updateMany({ _id: { $in: pending } }, { status: 'draft' })
+  const x = await Doc.updateMany({ _id: { $in: draft } }, { status: 'pending' })
   if (x.modifiedCount) {
     const [me, admins] = await Promise.all([
       User.findById(req.uid).select('name'),
@@ -452,6 +495,11 @@ o.post('/documents/submit', member('member'), h(async (req, res) => {
 
 o.post('/documents/status', member('admin'), h(async (req, res) => {
   const b = idList.extend({ status: z.enum(['draft', 'pending', 'approved']) }).parse(req.body)
+  const docsForAccess = await Doc.find({ org: orgOf(req), _id: { $in: b.ids } }).select('folder')
+  for (const d of docsForAccess) {
+    const folder = await Folder.findById(d.folder).select('access')
+    if (req.role !== 'owner' && !folderPermission(folder ?? {}, req, 'manage')) throw new HttpError(403, 'Only folder managers can approve files in this folder.')
+  }
   await Doc.updateMany({ org: orgOf(req), _id: { $in: b.ids } }, { status: b.status })
   await audit(orgOf(req), req.uid!, `document.${b.status}`, `${b.ids.length} file(s)`)
   if (b.status !== 'pending') {
@@ -461,12 +509,81 @@ o.post('/documents/status', member('admin'), h(async (req, res) => {
   res.status(204).end()
 }))
 
+o.post('/documents/delete-request', member('member'), h(async (req, res) => {
+  const { ids } = idList.parse(req.body)
+  const docs = await Doc.find({ org: orgOf(req), _id: { $in: ids }, trashed: false })
+  const allowed: typeof docs = []
+  for (const d of docs) {
+    const folder = await Folder.findById(d.folder).select('access')
+    if (req.role === 'owner' || folderPermission(folder ?? {}, req, 'delete')) allowed.push(d)
+  }
+  if (!allowed.length) throw new HttpError(403, 'You do not have delete access to these files.')
+  await Doc.updateMany({ _id: { $in: allowed.map((d) => d._id) } }, { deleteRequestedBy: req.uid, deleteRequestedAt: new Date() })
+  const managers = await Membership.find({ org: orgOf(req), role: { $in: ['owner', 'admin'] } }).select('user').lean()
+  await notify(managers.map((m) => m.user), orgOf(req), `${allowed.length} file deletion ${allowed.length === 1 ? 'request' : 'requests'} need approval`)
+  res.status(204).end()
+}))
+
+o.post('/documents/delete-decision', member('member'), h(async (req, res) => {
+  const b = idList.extend({ approved: z.boolean() }).parse(req.body)
+  const docs = await Doc.find({ org: orgOf(req), _id: { $in: b.ids }, deleteRequestedAt: { $ne: null } })
+  if (!docs.length) throw new HttpError(404, 'Deletion request not found.')
+  for (const d of docs) {
+    const folder = await Folder.findById(d.folder).select('access')
+    if (req.role !== 'owner' && !folderPermission(folder ?? {}, req, 'manage')) throw new HttpError(403, 'Only folder managers can decide this request.')
+  }
+  await Doc.updateMany({ _id: { $in: docs.map((d) => d._id) } }, b.approved ? { trashed: true, $unset: { deleteRequestedBy: 1, deleteRequestedAt: 1 } } : { $unset: { deleteRequestedBy: 1, deleteRequestedAt: 1 } })
+  res.status(204).end()
+}))
+
 o.delete('/documents', member('admin'), h(async (req, res) => {
   const { ids } = idList.parse(req.body)
   const docs = await Doc.find({ org: orgOf(req), _id: { $in: ids }, trashed: true })
+  for (const d of docs) {
+    const folder = await Folder.findById(d.folder).select('access')
+    if (req.role !== 'owner' && !folderPermission(folder ?? {}, req, 'manage')) throw new HttpError(403, 'Only folder managers can permanently delete files in this folder.')
+  }
   await Promise.all(docs.map((d) => del(d.key)))
   await Doc.deleteMany({ _id: { $in: docs.map((d) => d._id) } })
   await audit(orgOf(req), req.uid!, 'document.purge', `${docs.length} file(s)`)
+  res.status(204).end()
+}))
+
+o.get('/documents/:id', member('member'), h(async (req, res) => {
+  const d = await Doc.findOne({ _id: oid.parse(req.params.id), org: orgOf(req), trashed: false }).populate('owner', 'name').lean<DocLean>()
+  if (!d) throw new HttpError(404, 'Document not found.')
+  const allowed = req.role === 'owner' || (await visibleFolderIds(req)).some((id) => String(id) === String(d.folder))
+  if (!allowed) throw new HttpError(404, 'Document not found.')
+  const folder = await Folder.findById(d.folder).select('name').lean()
+  res.json({ ...dto(d, req.uid!), folderName: folder?.name ?? 'Unsorted', mime: d.mime ?? null, created: d.createdAt, deleteRequested: !!d.deleteRequestedAt })
+}))
+
+o.post('/documents/copy', member('member'), h(async (req, res) => {
+  const b = z.object({ ids: z.array(oid).min(1).max(20), folderId: oid }).parse(req.body)
+  const target = await Folder.findOne({ _id: b.folderId, org: orgOf(req) }).select('access')
+  if (!target || (req.role !== 'owner' && !folderPermission(target, req, 'upload'))) throw new HttpError(403, 'You do not have access to copy files into this folder.')
+  const docs = await Doc.find({ org: orgOf(req), _id: { $in: b.ids }, trashed: false }).lean()
+  for (const d of docs) {
+    const source = await Folder.findById(d.folder).select('access')
+    if (!source || (req.role !== 'owner' && !folderPermission(source, req, 'view'))) continue
+    const key = `${orgOf(req)}/${randomUUID()}`
+    await copy(d.key, key, d.mime)
+    await Doc.create({ org: orgOf(req), folder: b.folderId, owner: req.uid, name: d.name, key, mime: d.mime, size: d.size })
+  }
+  res.status(204).end()
+}))
+
+o.post('/documents/move', member('member'), h(async (req, res) => {
+  const b = z.object({ ids: z.array(oid).min(1).max(20), folderId: oid }).parse(req.body)
+  const target = await Folder.findOne({ _id: b.folderId, org: orgOf(req) }).select('access')
+  if (!target || (req.role !== 'owner' && !folderPermission(target, req, 'upload'))) throw new HttpError(403, 'You do not have access to move files into this folder.')
+  const docs = await Doc.find({ org: orgOf(req), _id: { $in: b.ids }, trashed: false })
+  for (const d of docs) {
+    const source = await Folder.findById(d.folder).select('access')
+    if (!source || (req.role !== 'owner' && !folderPermission(source, req, 'edit'))) continue
+    d.folder = b.folderId
+    await d.save()
+  }
   res.status(204).end()
 }))
 
