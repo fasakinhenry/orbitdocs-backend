@@ -39,10 +39,10 @@ const dto = (d: DocLean, uid: string) => ({
 const withOwner = (ids: Types.ObjectId[]) => Doc.find({ _id: { $in: ids } }).populate('owner', 'name').lean<DocLean[]>()
 
 // ---------- auth ----------
-const pub = (u: { _id: unknown; name: string; username: string; email: string; emailVerified?: boolean; avatarKey?: string; bio?: string; socialLinks?: Map<string, string> | Record<string, string>; profilePublic?: boolean }) => ({
+const pub = (u: { _id: unknown; name: string; username: string; email: string; emailVerified?: boolean; avatarKey?: string; bio?: string; socialLinks?: Map<string, string> | Record<string, string>; profilePublic?: boolean; defaultView?: 'list' | 'grid' }) => ({
   id: String(u._id), name: u.name, username: u.username, email: u.email, emailVerified: !!u.emailVerified,
   isAdmin: !!u.emailVerified && u.email === env.ADMIN_EMAIL.toLowerCase(),
-  avatarUrl: null as string | null, bio: u.bio ?? '', socialLinks: u.socialLinks ?? {}, profilePublic: u.profilePublic !== false,
+  avatarUrl: null as string | null, bio: u.bio ?? '', socialLinks: u.socialLinks ?? {}, profilePublic: u.profilePublic !== false, defaultView: u.defaultView ?? 'list',
 })
 
 async function mail(to: string, subject: string, heading: string, text: string, cta: string, link: string, note: string) {
@@ -201,10 +201,11 @@ r.get('/profile/:username', authLimit, h(async (req, res) => {
 
 r.patch('/profile', auth, h(async (req, res) => {
   const b = z.object({
-    name: z.string().trim().min(2).max(80),
-    bio: z.string().trim().max(500).default(''),
-    socialLinks: z.record(z.string().trim().max(200)).default({}),
-    profilePublic: z.boolean().default(true),
+    name: z.string().trim().min(2).max(80).optional(),
+    bio: z.string().trim().max(500).optional(),
+    socialLinks: z.record(z.string().trim().max(200)).optional(),
+    profilePublic: z.boolean().optional(),
+    defaultView: z.enum(['list', 'grid']).optional(),
   }).parse(req.body)
   const u = await User.findByIdAndUpdate(req.uid, b, { new: true })
   if (!u) throw new HttpError(401, 'Your session has expired. Sign in again.')

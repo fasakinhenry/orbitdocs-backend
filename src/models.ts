@@ -13,6 +13,7 @@ export const User = model('User', new Schema({
   bio: { type: String, default: '' },
   socialLinks: { type: Map, of: String, default: {} },
   profilePublic: { type: Boolean, default: true },
+  defaultView: { type: String, enum: ['list', 'grid'], default: 'list' },
   passwordChangedAt: Date,
 }, { timestamps: true }))
 
