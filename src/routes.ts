@@ -531,11 +531,38 @@ o.post('/invites', member('admin'), h(async (req, res) => {
   if (b.role === 'admin' && !['owner', 'admin'].includes(req.role!)) throw new HttpError(403, 'Only an admin can invite admins.')
   const org = orgOf(req)
   const existing = target ?? (await User.findOne({ email }))
-  if (existing && (await Membership.exists({ org, user: existing._id }))) throw new HttpError(409, 'This person is already a member.')
+  const portalTarget = target ?? existing
+  if (portalTarget && (await Membership.exists({ org, user: portalTarget._id }))) throw new HttpError(409, 'This person is already a member.')
   await Invite.deleteMany({ org, email, acceptedAt: null })
   const token = randomBytes(32).toString('hex')
-  const inv = await Invite.create({ org, email, username: target?.username, role: b.role, tokenHash: sha(token), invitedBy: req.uid, expiresAt: new Date(Date.now() + 7 * 864e5) })
+  const inv = await Invite.create({ org, email, username: portalTarget?.username, role: b.role, tokenHash: sha(token), invitedBy: req.uid, expiresAt: new Date(Date.now() + 7 * 864e5) })
   const [orgDoc, inviter] = await Promise.all([Org.findById(org), User.findById(req.uid)])
+  if (portalTarget) {
+    const invitationText = `${inviter?.name ?? 'An admin'} invited you to join ${orgDoc?.name ?? 'a workspace'} as an ${b.role === 'admin' ? 'admin' : 'member'}`
+    await notify([portalTarget._id], org, invitationText)
+    const personalMemberships = await Membership.find({ user: portalTarget._id, role: 'owner' })
+      .populate<{ org: { _id: Types.ObjectId; personal?: boolean } }>('org', 'personal').lean()
+    const personalMembership = personalMemberships.find((m) => m.org.personal)
+    if (personalMembership) await notify([portalTarget._id], personalMembership.org._id, invitationText)
+    const link = `${env.CLIENT_URL}/invite/${token}`
+    let emailSent = true
+    try {
+      const { error } = await resend.emails.send({
+        from: env.MAIL_FROM, to: portalTarget.email,
+        subject: `${inviter?.name ?? 'Someone'} invited you to ${orgDoc?.name ?? 'a workspace'} on OrbitDocs`,
+        html: `<div style="font-family:Inter,Arial,sans-serif;max-width:480px;margin:auto;padding:24px;color:#0f172a">
+          <h2 style="margin:0 0 12px">Join ${esc(orgDoc?.name ?? 'the workspace')}</h2>
+          <p style="color:#475569;line-height:1.6">${esc(inviter?.name ?? 'A teammate')} invited you to collaborate on documents in OrbitDocs.</p>
+          <p><a href="${link}" style="display:inline-block;background:#287bff;color:#fff;text-decoration:none;padding:12px 20px;border-radius:8px;font-weight:600">Accept invitation</a></p>
+          <p style="color:#94a3b8;font-size:13px">This invitation is also available in your OrbitDocs notifications.</p></div>`,
+      })
+      emailSent = !error
+    } catch {
+      emailSent = false
+    }
+    await audit(org, req.uid!, 'invite.send', label)
+    return res.status(201).json({ id: inv.id, to: label, role: inv.role, expires: inv.expiresAt, emailSent })
+  }
   const link = `${env.CLIENT_URL}/invite/${token}`
   const { error } = await resend.emails.send({
     from: env.MAIL_FROM, to: email,
@@ -580,6 +607,17 @@ o.delete('/members/:userId', member('admin'), h(async (req, res) => {
   const target = await User.findById(userId).select('name')
   await m.deleteOne()
   await audit(orgOf(req), req.uid!, 'member.remove', target?.name ?? 'A member')
+  res.status(204).end()
+}))
+
+o.post('/leave', member('member'), h(async (req, res) => {
+  if (req.role === 'owner') throw new HttpError(409, 'The organization owner cannot leave. Transfer ownership or delete the organization.')
+  const org = orgOf(req)
+  const user = await User.findById(req.uid).select('name')
+  await Membership.deleteOne({ org, user: req.uid })
+  await audit(org, req.uid!, 'member.leave', user?.name ?? 'A member')
+  const admins = await Membership.find({ org, role: { $in: ['owner', 'admin'] } }).select('user').lean()
+  await notify(admins.map((m) => m.user), org, `${user?.name ?? 'A member'} left the organization`)
   res.status(204).end()
 }))
 
