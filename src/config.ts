@@ -1,7 +1,8 @@
 import 'dotenv/config'
 import { z } from 'zod'
 
-const blank = <T extends z.ZodTypeAny>(t: T) => z.preprocess((v) => (v === '' ? undefined : v), t)
+const clean = <T extends z.ZodTypeAny>(t: T) => z.preprocess((v) => typeof v === 'string' ? v.trim() : v, t)
+const blank = <T extends z.ZodTypeAny>(t: T) => clean(z.preprocess((v) => (v === '' ? undefined : v), t))
 
 const schema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
@@ -13,9 +14,9 @@ const schema = z.object({
   STORAGE_PROVIDER: z.enum(['b2', 's3', 'r2', 'custom']).default('b2'),
   STORAGE_ENDPOINT: blank(z.string().url().optional()),
   STORAGE_REGION: blank(z.string().optional()),
-  STORAGE_ACCESS_KEY_ID: z.string().min(1),
-  STORAGE_SECRET_ACCESS_KEY: z.string().min(1),
-  STORAGE_BUCKET: z.string().min(1),
+  STORAGE_ACCESS_KEY_ID: clean(z.string().min(1)),
+  STORAGE_SECRET_ACCESS_KEY: clean(z.string().min(1)),
+  STORAGE_BUCKET: clean(z.string().min(1)),
   ADMIN_EMAIL: z.string().email(),
   RESEND_API_KEY: z.string().min(1),
   MAIL_FROM: z.string().min(3),
@@ -34,6 +35,10 @@ const need = [
 ]
 if (need.length) {
   console.error(`STORAGE_PROVIDER=${e.STORAGE_PROVIDER} also needs: ${need.join(', ')}`)
+  process.exit(1)
+}
+if (e.STORAGE_PROVIDER === 'b2' && e.STORAGE_ACCESS_KEY_ID === e.STORAGE_SECRET_ACCESS_KEY) {
+  console.error('Backblaze B2 requires different values for STORAGE_ACCESS_KEY_ID and STORAGE_SECRET_ACCESS_KEY.')
   process.exit(1)
 }
 export const env = e

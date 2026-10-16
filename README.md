@@ -13,6 +13,22 @@ Files live in any S3 compatible bucket. Set `STORAGE_PROVIDER` and the matching 
 
 Switching provider later is an env change. Existing files do not move automatically, so copy the bucket contents first.
 
+For Backblaze B2, the values must be configured as separate credentials:
+
+```env
+STORAGE_PROVIDER=b2
+STORAGE_REGION=us-east-005
+STORAGE_ENDPOINT=
+STORAGE_ACCESS_KEY_ID=<the application key ID>
+STORAGE_SECRET_ACCESS_KEY=<the application key secret>
+STORAGE_BUCKET=orbitdocs
+```
+
+For a bucket whose endpoint is `s3.us-east-005.backblazeb2.com`, `STORAGE_REGION` must be
+`us-east-005`. Do not use the bucket ID as `STORAGE_BUCKET`; use the bucket's exact name.
+The application key ID and application key secret are different values. Never put the ID in
+both fields. The generated key must have read and write access to the bucket.
+
 ## Cost protection
 
 Every workspace has a storage quota (default 200 MB), uploads are capped per file (default 25 MB), and trashed files still count until deleted forever. The platform admin can change the defaults, set a custom quota per workspace, suspend workspaces or users, and close sign ups from the admin dashboard.
