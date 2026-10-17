@@ -7,6 +7,8 @@ administration for the OrbitDocs frontend.
 
 > Check it out here: https://orbitdoc.vercel.app
 
+> Built with 💖 by [Fasakin Henry](https://github.com/fasakinhenry)
+
 ## Product capabilities
 
 The backend supports:
